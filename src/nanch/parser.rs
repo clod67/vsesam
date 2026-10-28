@@ -5,6 +5,7 @@ use std::rc::Rc;
 use super::ast::{BinOp, Expr, LogicOp, Stmt, UnOp};
 use super::token::{Spanned, Tok};
 
+#[derive(Debug)]
 pub struct ParseError {
     pub message: String,
     pub line: usize,

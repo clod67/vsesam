@@ -15,7 +15,9 @@
 mod ai;
 mod auth;
 mod engine;
+mod mcp;
 mod nanch;
+mod vault;
 
 use std::io::{self, BufRead, Write};
 use std::thread;
@@ -51,6 +53,7 @@ fn run(args: &[String]) -> i32 {
         }
         "register" => cmd_register(rest),
         "login" => cmd_login(rest),
+        "sso" => cmd_sso(rest),
         "logout" => {
             auth::logout();
             println!("вышел. сессия забыта.");
@@ -61,6 +64,12 @@ fn run(args: &[String]) -> i32 {
         "play" => cmd_run(rest, true),
         "demo" => cmd_demo(rest),
         "repl" => cmd_repl(rest),
+        "seal" => cmd_seal(rest),
+        "open" => cmd_open(rest),
+        "view" => cmd_view(rest),
+        "annotate" => cmd_annotate(rest),
+        "fmt" => cmd_fmt(rest),
+        "mcp" => cmd_mcp(rest),
         other => {
             eprintln!("неизвестная команда `{other}`. попробуй `vsesam help`.");
             2
@@ -85,17 +94,27 @@ fn help() {
 команды:
   register <user> <pass>      создать аккаунт
   login    <user> <pass>      войти (печатает и запоминает токен сессии)
+  sso [--session <id>]        войти по сессии Claude Code / Codex (хеш локально)
   logout                      забыть текущую сессию
   whoami   [--as <token>]     показать активную сессию
-  run  <script> [opts]        прогнать сцену и печатать кадры (не анимировано)
-  play <script> [opts]        анимированный прогон (очистка экрана, кадры)
+  run  <script|vault> [opts]  прогнать сцену и печатать кадры (не анимировано)
+  play <script|vault> [opts]  анимированный прогон (очистка экрана, кадры)
   demo [opts]                 встроенная арена с AI-агентами
   repl [--as <token>]         интерактивный nanch
+  seal <script> [--out f]     зашифровать скрипт в 67-слойный .vault (ключ-сессия)
+  open <vault>                расшифровать .vault своей сессией/паролем
+  view <vault>                фримиум: первая строка бесплатно, остальное заперто
+  annotate <script> [--out f] авто-комментарии из AST (не вайбкод)
+  fmt      <script> [--out f] переформатировать nanch (pretty-printer)
+  mcp                         MCP-сервер (JSON-RPC по stdio) для внешнего AI
 
 опции run/play/demo:
   --ticks N        число тиков симуляции (по умолчанию 40 / play 80)
   --size WxH       размер арены (по умолчанию 48x20)
   --as <token>     запустить под конкретной сессией (иначе — текущая/гость)
+  --sso            взять сессию из окружения (Claude Code / Codex)
+  --session <id>   задать идентичность сессии явно
+  --pass <p>       пароль для seal/open/run .vault (иначе — токен сессии)
 
 язык nanch (кратко):
   设 x = 5؛                объявить переменную,   ؛ завершает выражение
@@ -172,6 +191,220 @@ fn cmd_whoami(args: &[String]) -> i32 {
     0
 }
 
+fn cmd_sso(args: &[String]) -> i32 {
+    let (_pos, flags) = split_flags(args);
+    let (provider, raw) = if let Some(sid) = flag_value(&flags, "session") {
+        (flag_value(&flags, "provider").unwrap_or_else(|| "ai".to_string()), sid)
+    } else {
+        match auth::detect_sso() {
+            Some(pr) => pr,
+            None => {
+                eprintln!("не нашёл сессию Claude Code / Codex в окружении.");
+                eprintln!("передай явно:  vsesam sso --session <id> [--provider claude|codex]");
+                eprintln!("или задай переменную окружения VSESAM_AI_SESSION.");
+                return 1;
+            }
+        }
+    };
+    let session = auth::sso_login(&provider, &raw);
+    if let Err(e) = session.save() {
+        eprintln!("не сохранил сессию: {e}");
+        return 1;
+    }
+    println!("вошёл по SSO как `{}` (провайдер: {provider}).", session.user);
+    println!("токен сессии: {}", session.token);
+    println!("ключей в сессии: {}", session.kv.len());
+    println!("(идентичность хеширована локально; ничего никуда не отправлено.)");
+    0
+}
+
+// ---- vault (encryption) ------------------------------------------------
+
+fn cmd_seal(args: &[String]) -> i32 {
+    let (pos, flags) = split_flags(args);
+    let path = match pos.first() {
+        Some(p) => p,
+        None => {
+            eprintln!("использование: vsesam seal <script.nanch> [--out <file>] [--pass <p>]");
+            return 2;
+        }
+    };
+    let src = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("не прочитал `{path}`: {e}");
+            return 1;
+        }
+    };
+    let session = resolve_session(&flags);
+    let (pass, keyed_by) = match flag_value(&flags, "pass") {
+        Some(p) => (p, "паролем".to_string()),
+        None => (session.token.clone(), format!("сессией `{}`", session.user)),
+    };
+    let v = vault::Vault::seal(&src, pass.as_bytes());
+    let out = flag_value(&flags, "out").unwrap_or_else(|| format!("{path}.vault"));
+    if let Err(e) = std::fs::write(&out, v.to_text()) {
+        eprintln!("не записал `{out}`: {e}");
+        return 1;
+    }
+    println!("🔒 запечатано {} слоёв шифрования → {out}", vault::ROUNDS);
+    println!("   ключ: {keyed_by}");
+    println!("   открыть:  vsesam open {out}        посмотреть 1 строку:  vsesam view {out}");
+    0
+}
+
+fn cmd_open(args: &[String]) -> i32 {
+    let (pos, flags) = split_flags(args);
+    let path = match pos.first() {
+        Some(p) => p,
+        None => {
+            eprintln!("использование: vsesam open <file.vault> [--pass <p>]");
+            return 2;
+        }
+    };
+    let text = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("не прочитал `{path}`: {e}");
+            return 1;
+        }
+    };
+    let v = match vault::Vault::from_text(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("не разобрал .vault: {e}");
+            return 1;
+        }
+    };
+    let session = resolve_session(&flags);
+    let pass = flag_value(&flags, "pass").unwrap_or_else(|| session.token.clone());
+    match v.open(pass.as_bytes()) {
+        Ok(src) => {
+            print!("{src}");
+            if !src.ends_with('\n') {
+                println!();
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("🔒 {e}");
+            1
+        }
+    }
+}
+
+fn cmd_view(args: &[String]) -> i32 {
+    let (pos, _flags) = split_flags(args);
+    let path = match pos.first() {
+        Some(p) => p,
+        None => {
+            eprintln!("использование: vsesam view <file.vault>");
+            return 2;
+        }
+    };
+    let text = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("не прочитал `{path}`: {e}");
+            return 1;
+        }
+    };
+    match vault::Vault::from_text(&text) {
+        Ok(v) => {
+            print!("{}", v.preview());
+            0
+        }
+        Err(e) => {
+            eprintln!("не разобрал .vault: {e}");
+            1
+        }
+    }
+}
+
+// ---- auto-comment ------------------------------------------------------
+
+fn cmd_annotate(args: &[String]) -> i32 {
+    let (pos, flags) = split_flags(args);
+    let path = match pos.first() {
+        Some(p) => p,
+        None => {
+            eprintln!("использование: vsesam annotate <script.nanch> [--out <file>]");
+            return 2;
+        }
+    };
+    let src = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("не прочитал `{path}`: {e}");
+            return 1;
+        }
+    };
+    let stmts = match nanch::parse_program(&src) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    let annotated = nanch::printer::annotate(&stmts);
+    match flag_value(&flags, "out") {
+        Some(out) => {
+            if let Err(e) = std::fs::write(&out, &annotated) {
+                eprintln!("не записал `{out}`: {e}");
+                return 1;
+            }
+            println!("прокомментировано → {out}");
+        }
+        None => print!("{annotated}"),
+    }
+    0
+}
+
+fn cmd_fmt(args: &[String]) -> i32 {
+    let (pos, flags) = split_flags(args);
+    let path = match pos.first() {
+        Some(p) => p,
+        None => {
+            eprintln!("использование: vsesam fmt <script.nanch> [--out <file>]");
+            return 2;
+        }
+    };
+    let src = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("не прочитал `{path}`: {e}");
+            return 1;
+        }
+    };
+    let stmts = match nanch::parse_program(&src) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    let formatted = nanch::printer::pretty(&stmts);
+    match flag_value(&flags, "out") {
+        Some(out) => {
+            if let Err(e) = std::fs::write(&out, &formatted) {
+                eprintln!("не записал `{out}`: {e}");
+                return 1;
+            }
+            println!("отформатировано → {out}");
+        }
+        None => print!("{formatted}"),
+    }
+    0
+}
+
+// ---- MCP server --------------------------------------------------------
+
+fn cmd_mcp(args: &[String]) -> i32 {
+    let (_pos, flags) = split_flags(args);
+    let session = resolve_session(&flags);
+    mcp::serve(session)
+}
+
 // ---- running scripts ---------------------------------------------------
 
 fn cmd_run(args: &[String], animated: bool) -> i32 {
@@ -183,12 +416,36 @@ fn cmd_run(args: &[String], animated: bool) -> i32 {
             return 2;
         }
     };
-    let src = match std::fs::read_to_string(path) {
+    let raw = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("не прочитал `{path}`: {e}");
             return 1;
         }
+    };
+    // Vault files are decrypted at load — all 67 layers peeled, then run.
+    let src = if path.ends_with(".vault") {
+        let v = match vault::Vault::from_text(&raw) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("не разобрал .vault: {e}");
+                return 1;
+            }
+        };
+        let session = resolve_session(&flags);
+        let pass = flag_value(&flags, "pass").unwrap_or_else(|| session.token.clone());
+        match v.open(pass.as_bytes()) {
+            Ok(s) => {
+                println!("🔓 .vault расшифрован ({} слоёв сняты)", vault::ROUNDS);
+                s
+            }
+            Err(e) => {
+                eprintln!("🔒 {e}");
+                return 1;
+            }
+        }
+    } else {
+        raw
     };
     run_scene(&src, path, &flags, animated)
 }
@@ -342,6 +599,21 @@ fn resolve_session(flags: &[(String, Option<String>)]) -> Session {
             Ok(s) => return s,
             Err(e) => {
                 eprintln!("(--as: {e}; продолжаю гостем)");
+                return Session::guest();
+            }
+        }
+    }
+    // explicit coding-assistant identity
+    if let Some(sid) = flag_value(flags, "session") {
+        let provider = flag_value(flags, "provider").unwrap_or_else(|| "ai".to_string());
+        return auth::sso_login(&provider, &sid);
+    }
+    // auto-detect a Claude Code / Codex session from the environment
+    if flag_has(flags, "sso") {
+        match auth::detect_sso() {
+            Some((provider, raw)) => return auth::sso_login(&provider, &raw),
+            None => {
+                eprintln!("(--sso: сессия ассистента не найдена в окружении; гость)");
                 return Session::guest();
             }
         }

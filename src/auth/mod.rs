@@ -284,3 +284,73 @@ fn unescape(s: &str) -> String {
 pub fn initialized() -> bool {
     Path::new(&users_file()).exists()
 }
+
+// ---- SSO via a coding-assistant session --------------------------------
+//
+// "Login by your Claude Code / OpenAI Codex session." IMPORTANT, on purpose:
+// this reads only NON-SECRET identifiers from environment variables (or an
+// explicit value you pass), hashes them locally into an opaque account handle,
+// stores only that locally, and transmits NOTHING — the whole engine makes no
+// network calls. It never reads secret token files and never impersonates you
+// to any provider. It is single-sign-on by local identity, not credential
+// theft.
+
+/// Detect a coding-assistant session identity from the environment.
+/// Returns `(provider_label, raw_identity)` or `None` if nothing is present.
+pub fn detect_sso() -> Option<(String, String)> {
+    use std::env::var;
+
+    // 1. Explicit override wins.
+    if let Ok(s) = var("VSESAM_AI_SESSION") {
+        if !s.is_empty() {
+            let prov = var("VSESAM_AI_PROVIDER").unwrap_or_else(|_| "ai".into());
+            return Some((prov, s));
+        }
+    }
+
+    // 2. Claude Code.
+    for m in ["CLAUDE_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "ANTHROPIC_SESSION_ID"] {
+        if let Ok(s) = var(m) {
+            if !s.is_empty() {
+                return Some(("claude".into(), s));
+            }
+        }
+    }
+    if var("CLAUDECODE").is_ok() || var("CLAUDE_CODE_ENTRYPOINT").is_ok() {
+        let who = var("USER").or_else(|_| var("USERNAME")).unwrap_or_else(|_| "local".into());
+        return Some(("claude".into(), format!("claudecode:{who}")));
+    }
+
+    // 3. OpenAI Codex / similar.
+    for m in ["CODEX_SESSION_ID", "OPENAI_SESSION_ID", "CODEX_SESSION"] {
+        if let Ok(s) = var(m) {
+            if !s.is_empty() {
+                return Some(("codex".into(), s));
+            }
+        }
+    }
+    if var("CODEX").is_ok() || var("OPENAI_CODEX").is_ok() {
+        let who = var("USER").or_else(|_| var("USERNAME")).unwrap_or_else(|_| "local".into());
+        return Some(("codex".into(), format!("codex:{who}")));
+    }
+
+    None
+}
+
+/// Build (or reattach to) a passwordless SSO session from a provider identity.
+/// The identity is hashed; the raw value is never stored.
+pub fn sso_login(provider: &str, raw_identity: &str) -> Session {
+    let handle = format!("{provider}:{}", &sha256_hex(raw_identity.as_bytes())[..12]);
+    let token = token_for_sso(provider, raw_identity);
+    let kv = load_session_kv(&token);
+    Session {
+        user: handle,
+        token,
+        kv,
+        persistent: true,
+    }
+}
+
+fn token_for_sso(provider: &str, raw: &str) -> String {
+    sha256_hex(format!("vsesam-sso\u{0}{provider}\u{0}{raw}").as_bytes())[..40].to_string()
+}
