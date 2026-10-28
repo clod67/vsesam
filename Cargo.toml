@@ -1,0 +1,19 @@
+[package]
+name = "vsesam"
+version = "0.1.0"
+edition = "2021"
+description = "VSESAM — a Rust game engine driven by the nanch esoteric scripting language, with AI agents and session-embedded login"
+license = "Unlicense"
+
+[[bin]]
+name = "vsesam"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+
+# std-only on purpose: VSESAM has ZERO third-party dependencies so it builds
+# anywhere `rustc` lives. The scripting language, ECS, renderer, AI brains,
+# password hashing (SHA-256) and session store are all hand-rolled.
+[dependencies]
